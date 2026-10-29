@@ -4,12 +4,13 @@ const socket = new WebSocket("wss://amra-signal.devusimple.workers.dev/ws");
 import { useEffect, useState } from "react"
 
 export default function MainView() {
-
+    const [messages, setMessages] = useState<string[]>([])
     const [message, setMessage] = useState("")
 
 
     useEffect(() => {
         socket.onmessage = (e) => {
+            setMessages(p => ([...p, e.data]))
             console.log(e.data)
         }
     }, []);
@@ -19,7 +20,12 @@ export default function MainView() {
 
     return (
         <div className="w-full h-screen grid place-content-center">
-            <div className="w-md">
+
+            {messages.map(m => (
+                <p className="p-2">{m}</p>
+            ))}
+
+            <div className="max-w-md w-full">
                 <div className="bg-gray-200 flex items-center p-2 rounded-md">
                     <input type="text" className="p-2 rounded-md flex-1 focus:outline-0" placeholder="message..."
                         value={message}
