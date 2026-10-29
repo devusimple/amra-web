@@ -19,13 +19,16 @@ export default function MainView() {
 
 
     return (
-        <div className="w-full h-screen grid place-content-center">
+        <div className="w-full h-screen p-6 grid place-content-center">
 
-            {messages.map(m => (
-                <p className="p-2">{m}</p>
-            ))}
 
-            <div className="max-w-md w-full">
+            <div className="w-[90dvw] h-[400px] overflow-auto">
+                {messages.map(m => (
+                    <p className="p-2">{m}</p>
+                ))}
+            </div>
+
+            <div className="w-full">
                 <div className="bg-gray-200 flex items-center p-2 rounded-md">
                     <input type="text" className="p-2 rounded-md flex-1 focus:outline-0" placeholder="message..."
                         value={message}
