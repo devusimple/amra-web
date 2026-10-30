@@ -3,33 +3,25 @@ import { AuthView } from "./view/auth-view";
 import MainView from "./view/main-view";
 
 export default function App() {
-
-
-
-  return (
-    <AuthProvider>
-      <RootView />
-    </AuthProvider>
-  )
+    return (
+        <AuthProvider>
+            <RootView />
+        </AuthProvider>
+    );
 }
-
 
 function RootView() {
-  const { loading, session } = useAuth()
+    const { loading, session } = useAuth();
 
-  if (loading) return (
-    <div className="w-full h-screen grid place-content-center">
-      <div className="grid place-content-center w-16 h-16 outline-5 outline-blue-400 rounded-full animate-pulse">
-        <div className="w-14 h-14 bg-amber-300 rounded-full animate-ping"></div>
-      </div>
-    </div>
-  )
+    if (loading) {
+        return (
+            <div className="grid h-dvh place-content-center bg-neutral-950">
+                <div className="h-12 w-12 animate-spin rounded-full border-2 border-emerald-500/25 border-t-emerald-400" />
+            </div>
+        );
+    }
 
-  if (!session) return <AuthView />
+    if (!session) return <AuthView />;
 
-  return (
-    <MainView />
-  )
+    return <MainView />;
 }
-
-

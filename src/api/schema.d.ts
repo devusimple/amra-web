@@ -107,6 +107,23 @@ export interface paths {
         patch: operations["updateMe"];
         trace?: never;
     };
+    "/api/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List all users with their public profile (email hidden) */
+        get: operations["listPublicProfiles"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/users/{id}": {
         parameters: {
             query?: never;
@@ -116,23 +133,6 @@ export interface paths {
         };
         /** Public profile (email hidden) */
         get: operations["getPublicProfile"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/users": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Public profile (email hidden) */
-        get: operations["getPublicProfiles"];
         put?: never;
         post?: never;
         delete?: never;
@@ -305,14 +305,38 @@ export interface components {
             user?: components["schemas"]["User"];
             profile?: components["schemas"]["Profile"];
         };
-        UserWithProfiles: {
-            error?: components["schemas"]["Error"];
-            data?: unknown;
+        /** @description User without email */
+        PublicUser: {
+            id?: number;
+            created_at?: string;
+        };
+        /** @description Public profile fields (no `updated_at`) */
+        PublicProfile: {
+            display_name?: string;
+            bio?: string;
+            avatar_url?: string | null;
+        };
+        PublicUserWithProfile: {
+            user?: components["schemas"]["PublicUser"];
+            profile?: components["schemas"]["PublicProfile"];
+        };
+        /** @description Flat user + profile row */
+        PublicUserRow: {
+            id?: number;
+            created_at?: string;
+            display_name?: string;
+            bio?: string;
+            avatar_url?: string | null;
+        };
+        PublicUserListResponse: {
+            success?: boolean;
+            error?: string | null;
+            data?: components["schemas"]["PublicUserRow"][];
         };
         AuthResponse: {
-            /** @description HS256 JWT, 7-day expiry */
-            token?: string;
-            user?: components["schemas"]["User"];
+            /** @description HS256 JWT, 30-day expiry */
+            token: string;
+            user: components["schemas"]["User"];
         };
         /** @enum {string} */
         CallStatus: "pending" | "active" | "declined" | "ended";
@@ -403,6 +427,15 @@ export interface components {
         };
         /** @description Conflicting state (duplicate email, double answer, call already terminal, ...) */
         Conflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Server error (e.g. missing JWT_SECRET, database failure) */
+        ServerError: {
             headers: {
                 [name: string]: unknown;
             };
@@ -557,6 +590,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            500: components["responses"]["ServerError"];
         };
     };
     getMe: {
@@ -579,6 +613,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["ServerError"];
         };
     };
     updateMe: {
@@ -607,6 +642,27 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            500: components["responses"]["ServerError"];
+        };
+    };
+    listPublicProfiles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Flat list of users (newest ids first, no paging) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicUserListResponse"];
+                };
+            };
         };
     };
     getPublicProfile: {
@@ -626,29 +682,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["UserWithProfile"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-            404: components["responses"]["NotFound"];
-        };
-    };
-    getPublicProfiles: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Public profile */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["UserWithProfiles"];
+                    "application/json": components["schemas"]["PublicUserWithProfile"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -676,6 +710,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            500: components["responses"]["ServerError"];
         };
     };
     createCall: {
@@ -714,6 +749,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            500: components["responses"]["ServerError"];
         };
     };
     listPendingOffers: {
@@ -737,6 +773,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            500: components["responses"]["ServerError"];
         };
     };
     getCall: {
@@ -764,6 +801,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["ServerError"];
         };
     };
     answerCall: {
@@ -806,6 +844,7 @@ export interface operations {
             };
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            500: components["responses"]["ServerError"];
         };
     };
     declineCall: {
@@ -841,6 +880,7 @@ export interface operations {
             };
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            500: components["responses"]["ServerError"];
         };
     };
     endCall: {
@@ -867,6 +907,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["ServerError"];
         };
     };
     listCandidates: {
@@ -897,6 +938,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["ServerError"];
         };
     };
     addCandidate: {
@@ -943,6 +985,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            500: components["responses"]["ServerError"];
         };
     };
     websocket: {
@@ -967,7 +1010,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Error"];
+                    "text/plain": string;
                 };
             };
         };
