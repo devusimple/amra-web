@@ -1,5 +1,5 @@
 import { client } from "../api/client";
-import { db, type Message } from "../db";
+import { db, type FileMeta, type Message } from "../db";
 import { createPeer, hasMediaSdp, hasVideoSdp } from "./webrtc";
 
 /* ------------------------------------------------------------------ *
@@ -35,14 +35,45 @@ export type Snapshot = {
     incoming: IncomingCall | null;
     call: ActiveCall | null;
     toast: string | null;
+    /** Live file transfers, keyed by message id. */
+    transfers: Record<string, FileTransfer>;
 };
 
+/** Progress of one attachment moving over the data channel. */
+export type FileTransfer = {
+    id: string;
+    peerId: number;
+    name: string;
+    size: number;
+    bytes: number;
+    dir: "in" | "out";
+    status: "active" | "done" | "error";
+    error?: string;
+};
+
+/** Largest attachment we accept (kept in memory while transferring). */
+export const MAX_FILE_BYTES = 25 * 1024 * 1024;
+
 /** JSON frames exchanged over the peer-to-peer data channel. */
-type WireMessage = { id: string; from: number; to: number; body: string; ts: number };
+type WireMessage = { id: string; from: number; to: number; body: string; ts: number; file?: FileMeta };
 type Wire =
     | { t: "sync"; msgs: WireMessage[] }
     | { t: "msg"; m: WireMessage }
-    | { t: "ack"; ids: string[] };
+    | { t: "ack"; ids: string[] }
+    | { t: "file-start"; f: FileMeta }
+    | { t: "file-end"; id: string }
+    | { t: "file-ack"; id: string; ok: boolean; error?: string };
+
+/** Bytes buffered per chunk — small enough for every browser's SCTP limits. */
+const FILE_CHUNK_BYTES = 16 * 1024;
+/** Pause sending while the channel has more than this queued. */
+const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+
+type IncomingFile = FileMeta & {
+    chunks: Uint8Array[];
+    received: number;
+    rejected: boolean;
+};
 
 type Session = {
     key: string;
@@ -101,7 +132,16 @@ export class CallManager {
     /** Bumped on stop() so in-flight negotiations can abort cleanly. */
     private generation = 0;
     private listeners = new Set<() => void>();
-    private snapshot: Snapshot = { chat: {}, incoming: null, call: null, toast: null };
+    private transfers: Record<string, FileTransfer> = {};
+    private incomingFiles = new Map<number, IncomingFile>();
+    /** Message ids currently being written to the wire (avoid double sends). */
+    private transferring = new Set<string>();
+    /** Attachments fully sent but not yet acked, keyed by message id → peer. */
+    private awaitingAck = new Map<string, number>();
+    /** Serializes delivery per peer so chunks never interleave. */
+    private deliverTasks = new Map<number, Promise<void>>();
+    private lastProgressAt = 0;
+    private snapshot: Snapshot = { chat: {}, incoming: null, call: null, toast: null, transfers: {} };
 
     /* --------------------------- react glue --------------------------- */
 
@@ -124,6 +164,7 @@ export class CallManager {
             incoming: this.incomingQueue[0] ?? null,
             call: this.activeCall,
             toast: this.toast,
+            transfers: this.transfers,
         };
         for (const listener of this.listeners) listener();
     }
@@ -182,6 +223,11 @@ export class CallManager {
         this.incomingQueue = [];
         this.handledOffers.clear();
         this.activeCall = null;
+        this.incomingFiles.clear();
+        this.transfers = {};
+        this.transferring.clear();
+        this.awaitingAck.clear();
+        this.deliverTasks.clear();
         if (this.toastTimer) clearTimeout(this.toastTimer);
         this.toast = null;
         this.me = null;
@@ -519,6 +565,12 @@ export class CallManager {
         try {
             if (args.kind === "chat") {
                 this.bindDataChannel(sess, pc.createDataChannel("chat"));
+            } else if (args.localStream) {
+                // Without tracks the offer would be a track-less SDP, which the
+                // callee classifies as a chat session instead of ringing.
+                for (const track of args.localStream.getTracks()) {
+                    pc.addTrack(track, args.localStream);
+                }
             }
 
             const offer = await pc.createOffer();
@@ -779,6 +831,20 @@ export class CallManager {
         sess.icePollId = null;
         sess.statusPollId = null;
 
+        if (sess.kind === "chat") {
+            // A dropped channel means "send again on reconnect" for any file
+            // that has not been acked yet, and any partial download is void.
+            for (const [id, peer] of this.awaitingAck) {
+                if (peer === sess.peerId) this.awaitingAck.delete(id);
+            }
+            for (const [id, transfer] of Object.entries(this.transfers)) {
+                if (transfer.peerId === sess.peerId && transfer.status === "active") {
+                    delete this.transfers[id];
+                }
+            }
+            this.incomingFiles.delete(sess.peerId);
+        }
+
         try {
             sess.dc?.close();
         } catch {
@@ -862,26 +928,223 @@ export class CallManager {
         return msg;
     }
 
-    private async deliverPending(peerId: number): Promise<void> {
+    /**
+     * Queue a file for peer-to-peer delivery. The blob is kept in IndexedDB so
+     * it survives reloads and is retried whenever the data channel reopens.
+     */
+    async sendFile(peerId: number, file: File): Promise<Message | null> {
+        if (this.me === null) return null;
+        if (file.size === 0) {
+            this.showToast("That file is empty");
+            return null;
+        }
+        if (file.size > MAX_FILE_BYTES) {
+            this.showToast(`File is too large (max ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB)`);
+            return null;
+        }
+
+        const id = crypto.randomUUID();
+        const meta: FileMeta = {
+            id,
+            name: file.name || "file",
+            type: file.type || "application/octet-stream",
+            size: file.size,
+        };
+        const msg: Message = {
+            id,
+            peerId,
+            from: this.me,
+            to: peerId,
+            body: "",
+            ts: Date.now(),
+            dir: "out",
+            status: "pending",
+            file: meta,
+        };
+        await db.transaction("rw", db.messages, db.files, async () => {
+            await db.files.put({ ...meta, peerId, blob: file, ts: msg.ts });
+            await db.messages.put(msg);
+        });
+        this.transfers[id] = {
+            id,
+            peerId,
+            name: meta.name,
+            size: meta.size,
+            bytes: 0,
+            dir: "out",
+            status: "active",
+        };
+        this.emit();
+        this.deliverPending(peerId).catch((err) => console.error("[amra] deliver failed", err));
+        return msg;
+    }
+
+    private deliverPending(peerId: number, filesOnly = false): Promise<void> {
+        // Serialize per peer: overlapping runs would interleave file chunks.
+        const previous = this.deliverTasks.get(peerId) ?? Promise.resolve();
+        const task = previous.catch(() => {}).then(() => this.runDeliver(peerId, filesOnly));
+        this.deliverTasks.set(peerId, task);
+        task.catch(() => {}).then(() => {
+            if (this.deliverTasks.get(peerId) === task) this.deliverTasks.delete(peerId);
+        });
+        return task;
+    }
+
+    private async runDeliver(peerId: number, filesOnly: boolean): Promise<void> {
         const sess = this.sessions.get(`chat:${peerId}`);
         if (!sess || sess.state !== "open" || sess.dc?.readyState !== "open") {
             // Not connected yet — (re)start the session; everything, including
-            // this message, is flushed by the sync that runs on channel open.
-            await this.openChat(peerId);
+            // these messages, is flushed when the channel opens.
+            if (!filesOnly) await this.openChat(peerId);
             return;
         }
         const rows = await db.messages
             .where("peerId")
             .equals(peerId)
-            .filter((row) => row.dir === "out" && row.status !== "delivered")
+            .filter((row) => row.dir === "out"
+                && row.status !== "delivered"
+                && row.status !== "failed"
+                && (!filesOnly || !!row.file))
             .sortBy("ts");
+
         for (const row of rows) {
-            const ok = this.sendWire(peerId, {
-                t: "msg",
-                m: { id: row.id, from: row.from, to: row.to, body: row.body, ts: row.ts },
-            });
-            if (ok) await db.messages.update(row.id, { status: "sent" });
+            if (sess.closed || sess.dc?.readyState !== "open") return;
+            if (row.file) {
+                if (this.transferring.has(row.id) || this.awaitingAck.has(row.id)) continue;
+                await this.sendFileMessage(sess, row);
+            } else if (!filesOnly) {
+                const ok = this.sendWire(peerId, {
+                    t: "msg",
+                    m: { id: row.id, from: row.from, to: row.to, body: row.body, ts: row.ts },
+                });
+                if (ok) await db.messages.update(row.id, { status: "sent" });
+            }
         }
+    }
+
+    /** Stream one stored attachment down the session's data channel. */
+    private async sendFileMessage(sess: Session, row: Message): Promise<void> {
+        const meta = row.file;
+        const dc = sess.dc;
+        if (!meta || !dc) return;
+
+        const stored = await db.files.get(row.id);
+        if (!stored?.blob) {
+            await db.messages.update(row.id, { status: "failed", error: "File data is unavailable" });
+            this.finishTransfer(row.id, "error", "File data is unavailable");
+            return;
+        }
+
+        this.transferring.add(row.id);
+        try {
+            if (!this.sendWire(row.peerId, { t: "file-start", f: meta })) return;
+            await db.messages.update(row.id, { status: "sent" });
+            this.setTransfer({
+                id: row.id,
+                peerId: row.peerId,
+                name: meta.name,
+                size: meta.size,
+                bytes: 0,
+                dir: "out",
+                status: "active",
+            }, true);
+
+            const buffer = await stored.blob.arrayBuffer();
+            let offset = 0;
+            while (offset < buffer.byteLength) {
+                if (sess.closed || dc.readyState !== "open") return;
+                const end = Math.min(offset + FILE_CHUNK_BYTES, buffer.byteLength);
+                try {
+                    dc.send(buffer.slice(offset, end));
+                } catch {
+                    return;
+                }
+                offset = end;
+                this.setTransferBytes(row.id, offset);
+                await this.waitForDrain(dc);
+            }
+
+            if (sess.closed || dc.readyState !== "open") return;
+            if (!this.sendWire(row.peerId, { t: "file-end", id: row.id })) return;
+
+            // Do not mark delivered yet — the peer acks once the blob is stored.
+            this.awaitingAck.set(row.id, row.peerId);
+            setTimeout(() => {
+                // A lost ack should not pin the file forever.
+                if (this.awaitingAck.get(row.id) === row.peerId) this.awaitingAck.delete(row.id);
+            }, 60_000);
+            this.finishTransfer(row.id, "done");
+        } catch (err) {
+            console.error("[amra] file send failed", err);
+            this.finishTransfer(row.id, "error", "Could not send the file");
+        } finally {
+            this.transferring.delete(row.id);
+        }
+    }
+
+    private waitForDrain(dc: RTCDataChannel): Promise<void> {
+        if (dc.readyState !== "open" || dc.bufferedAmount <= MAX_BUFFERED_BYTES) {
+            return Promise.resolve();
+        }
+        return new Promise((resolve) => {
+            let settled = false;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                dc.removeEventListener("bufferedamountlow", finish);
+                if (timer) clearTimeout(timer);
+                resolve();
+            };
+            dc.addEventListener("bufferedamountlow", finish);
+            timer = setTimeout(finish, 2_000);
+        });
+    }
+
+    private setTransfer(transfer: FileTransfer, force = false): void {
+        this.transfers[transfer.id] = transfer;
+        this.emitProgress(force);
+    }
+
+    private setTransferBytes(id: string, bytes: number): void {
+        const current = this.transfers[id];
+        if (!current) return;
+        this.transfers[id] = { ...current, bytes };
+        this.emitProgress();
+    }
+
+    private emitProgress(force = false): void {
+        const now = Date.now();
+        if (!force && now - this.lastProgressAt < 80) return;
+        this.lastProgressAt = now;
+        this.emit();
+    }
+
+    /** Reset a failed attachment so the next delivery pass sends it again. */
+    async retryFile(id: string): Promise<void> {
+        const row = await db.messages.get(id);
+        if (!row?.file || this.me === null) return;
+        await db.messages.update(id, { status: "pending", error: undefined });
+        this.awaitingAck.delete(id);
+        this.deliverPending(row.peerId).catch((err) => console.error("[amra] file retry failed", err));
+    }
+
+    private finishTransfer(id: string, status: "done" | "error", error?: string): void {
+        const current = this.transfers[id];
+        if (!current) return;
+        this.transfers[id] = {
+            ...current,
+            bytes: status === "done" ? current.size : current.bytes,
+            status,
+            error,
+        };
+        this.emit();
+        setTimeout(() => {
+            if (this.transfers[id]?.status === status) {
+                delete this.transfers[id];
+                this.emit();
+            }
+        }, 3_000);
     }
 
     private sendWire(peerId: number, wire: Wire): boolean {
@@ -897,6 +1160,8 @@ export class CallManager {
 
     private bindDataChannel(sess: Session, dc: RTCDataChannel): void {
         sess.dc = dc;
+        dc.binaryType = "arraybuffer";
+        dc.bufferedAmountLowThreshold = MAX_BUFFERED_BYTES / 2;
         dc.onopen = () => {
             if (sess.closed) return;
             sess.state = "open";
@@ -904,8 +1169,11 @@ export class CallManager {
             this.syncToPeer(sess.peerId).catch((err) => console.error("[amra] sync failed", err));
         };
         dc.onmessage = (e) => {
-            if (typeof e.data !== "string") return;
-            this.handleWire(sess.peerId, e.data).catch((err) => console.error("[amra] wire failed", err));
+            if (typeof e.data === "string") {
+                this.handleWire(sess.peerId, e.data).catch((err) => console.error("[amra] wire failed", err));
+            } else if (e.data instanceof ArrayBuffer) {
+                this.handleFileChunk(sess.peerId, e.data);
+            }
         };
         dc.onclose = () => {
             this.endSession(sess, { endRemote: true });
@@ -918,14 +1186,23 @@ export class CallManager {
         if (rows.length) {
             this.sendWire(peerId, {
                 t: "sync",
-                msgs: rows.map((r) => ({ id: r.id, from: r.from, to: r.to, body: r.body, ts: r.ts })),
+                msgs: rows.map((r) => ({
+                    id: r.id,
+                    from: r.from,
+                    to: r.to,
+                    body: r.body,
+                    ts: r.ts,
+                    ...(r.file ? { file: r.file } : {}),
+                })),
             });
         }
         for (const row of rows) {
-            if (row.dir === "out" && row.status !== "delivered") {
+            if (row.dir === "out" && row.status === "pending") {
                 await db.messages.update(row.id, { status: "sent" });
             }
         }
+        // Text is covered by the sync frame; attachments still need their bytes.
+        await this.deliverPending(peerId, true);
     }
 
     private async handleWire(peerId: number, raw: string): Promise<void> {
@@ -939,35 +1216,192 @@ export class CallManager {
 
         if (wire?.t === "msg" && wire.m) {
             await this.ingest(peerId, wire.m);
-            this.sendWire(peerId, { t: "ack", ids: [wire.m.id] });
+            await this.ackIncoming(peerId, wire.m);
         } else if (wire?.t === "sync" && Array.isArray(wire.msgs)) {
             const ackIds: string[] = [];
             for (const m of wire.msgs) {
                 await this.ingest(peerId, m);
                 // Only ack what the peer sent us — that marks it delivered on
-                // their side. (Their view of our messages is marked directly.)
-                if (m.from !== this.me) ackIds.push(m.id);
+                // their side. Attachments are acked after their bytes arrive.
+                if (m.from === this.me) continue;
+                if (m.file) await this.ackIncoming(peerId, m);
+                else ackIds.push(m.id);
             }
             if (ackIds.length) this.sendWire(peerId, { t: "ack", ids: ackIds });
         } else if (wire?.t === "ack" && Array.isArray(wire.ids)) {
             for (const id of wire.ids) {
                 const row = await db.messages.get(id);
-                if (row && row.dir === "out" && row.peerId === peerId && row.status !== "delivered") {
+                // Attachments use file-ack, which also confirms the blob exists.
+                if (row && !row.file && row.dir === "out" && row.peerId === peerId && row.status !== "delivered") {
                     await db.messages.update(id, { status: "delivered" });
                 }
             }
+        } else if (wire?.t === "file-start" && wire.f) {
+            this.handleFileStart(peerId, wire.f);
+        } else if (wire?.t === "file-end" && typeof wire.id === "string") {
+            await this.handleFileEnd(peerId, wire.id);
+        } else if (wire?.t === "file-ack" && typeof wire.id === "string") {
+            await this.handleFileAck(peerId, wire.id, wire.ok, wire.error);
         }
     }
 
+    /** Ack a message the peer sent us (files only once their bytes are stored). */
+    private async ackIncoming(peerId: number, m: WireMessage): Promise<void> {
+        if (m.from === this.me) return;
+        if (m.file) {
+            const stored = await db.files.get(m.id);
+            if (stored?.blob) this.sendWire(peerId, { t: "file-ack", id: m.id, ok: true });
+            return;
+        }
+        this.sendWire(peerId, { t: "ack", ids: [m.id] });
+    }
+
+    private handleFileStart(peerId: number, incoming: FileMeta): void {
+        if (!incoming || typeof incoming.id !== "string") return;
+
+        const meta: FileMeta = {
+            id: incoming.id,
+            name: typeof incoming.name === "string" ? incoming.name.slice(0, 255) : "file",
+            type: typeof incoming.type === "string" ? incoming.type : "",
+            size: Number(incoming.size) || 0,
+        };
+        const rejected = meta.size > MAX_FILE_BYTES;
+
+        // Register synchronously: binary chunks follow immediately on the same
+        // channel and must find this entry, before any IndexedDB work awaits.
+        this.incomingFiles.set(peerId, { ...meta, chunks: [], received: 0, rejected });
+        this.setTransfer({
+            id: meta.id,
+            peerId,
+            name: meta.name,
+            size: meta.size,
+            bytes: 0,
+            dir: "in",
+            status: rejected ? "error" : "active",
+            error: rejected ? "File is too large" : undefined,
+        }, true);
+
+        if (rejected) {
+            this.sendWire(peerId, { t: "file-ack", id: meta.id, ok: false, error: "File is too large" });
+            this.finishTransfer(meta.id, "error", "File is too large");
+            return;
+        }
+
+        // Already have the bytes (e.g. the sender retried after a lost ack).
+        db.files.get(meta.id).then((existing) => {
+            if (!existing?.blob) return;
+            const current = this.incomingFiles.get(peerId);
+            if (current?.id === meta.id) this.incomingFiles.delete(peerId);
+            this.sendWire(peerId, { t: "file-ack", id: meta.id, ok: true });
+            this.finishTransfer(meta.id, "done");
+        }).catch(() => { /* a lookup failure is harmless — the transfer proceeds */ });
+    }
+
+    private handleFileChunk(peerId: number, data: ArrayBuffer): void {
+        const current = this.incomingFiles.get(peerId);
+        if (!current || current.rejected) return;
+        if (current.received + data.byteLength > current.size) {
+            current.rejected = true;
+            current.chunks = [];
+            return;
+        }
+        current.chunks.push(new Uint8Array(data));
+        current.received += data.byteLength;
+        this.setTransferBytes(current.id, current.received);
+    }
+
+    private async handleFileEnd(peerId: number, id: string): Promise<void> {
+        const current = this.incomingFiles.get(peerId);
+        this.incomingFiles.delete(peerId);
+        if (!current || current.id !== id) return;
+
+        if (current.rejected) {
+            this.sendWire(peerId, { t: "file-ack", id, ok: false, error: "File could not be received" });
+            return;
+        }
+        if (current.received !== current.size) {
+            this.finishTransfer(id, "error", "Incomplete file");
+            this.sendWire(peerId, { t: "file-ack", id, ok: false, error: "Incomplete file" });
+            return;
+        }
+
+        const meta: FileMeta = { id, name: current.name, type: current.type, size: current.size };
+        const blob = new Blob(current.chunks as BlobPart[], {
+            type: current.type || "application/octet-stream",
+        });
+        const existing = await db.messages.get(id);
+        const ts = existing?.ts ?? Date.now();
+
+        try {
+            await db.transaction("rw", db.messages, db.files, async () => {
+                await db.files.put({ ...meta, peerId, blob, ts });
+                const message: Message = existing
+                    ? { ...existing, file: meta }
+                    : {
+                        id,
+                        peerId,
+                        from: peerId,
+                        to: this.me ?? peerId,
+                        body: "",
+                        ts,
+                        dir: "in",
+                        status: "delivered",
+                        file: meta,
+                    };
+                await db.messages.put(message);
+            });
+        } catch (err) {
+            console.error("[amra] could not store the received file", err);
+            this.finishTransfer(id, "error", "Could not store the file");
+            this.sendWire(peerId, { t: "file-ack", id, ok: false, error: "Could not store the file" });
+            return;
+        }
+
+        this.sendWire(peerId, { t: "file-ack", id, ok: true });
+        this.finishTransfer(id, "done");
+    }
+
+    private async handleFileAck(peerId: number, id: string, ok: boolean, error?: string): Promise<void> {
+        this.awaitingAck.delete(id);
+        const row = await db.messages.get(id);
+        if (row && row.dir === "out" && row.peerId === peerId) {
+            if (ok) {
+                await db.messages.update(id, { status: "delivered", error: undefined });
+            } else {
+                await db.messages.update(id, {
+                    status: "failed",
+                    error: error || "The peer could not receive the file",
+                });
+            }
+        }
+        if (ok) {
+            this.finishTransfer(id, "done");
+        } else {
+            this.finishTransfer(id, "error", error || "Transfer failed");
+            this.showToast(error || "The peer could not receive the file");
+        }
+        this.emit();
+    }
+
     private async ingest(peerId: number, m: WireMessage): Promise<void> {
-        if (!m?.id || typeof m.body !== "string") return;
+        if (!m?.id || (typeof m.body !== "string" && !m.file)) return;
         const dir: Message["dir"] = m.from === this.me ? "out" : "in";
+        const file: FileMeta | undefined = m.file
+            ? {
+                id: m.id,
+                name: typeof m.file.name === "string" ? m.file.name.slice(0, 255) : "file",
+                type: typeof m.file.type === "string" ? m.file.type : "",
+                size: Number(m.file.size) || 0,
+            }
+            : undefined;
         const existing = await db.messages.get(m.id);
         if (existing) {
-            // Already stored (dedup by uuid) — upgrade our copy's status if
-            // the peer confirmed receipt of one of our outgoing messages.
-            if (dir === "out" && existing.status !== "delivered") {
+            // Already stored (dedup by uuid). A synced copy of one of our own
+            // text messages means the peer has it — files need file-ack instead.
+            if (dir === "out" && !existing.file && existing.status !== "delivered") {
                 await db.messages.update(m.id, { status: "delivered" });
+            } else if (file && !existing.file) {
+                await db.messages.update(m.id, { file });
             }
             return;
         }
@@ -976,10 +1410,11 @@ export class CallManager {
             peerId,
             from: m.from,
             to: m.to,
-            body: m.body,
+            body: typeof m.body === "string" ? m.body : "",
             ts: typeof m.ts === "number" ? m.ts : Date.now(),
             dir,
             status: "delivered",
+            ...(file ? { file } : {}),
         });
     }
 }

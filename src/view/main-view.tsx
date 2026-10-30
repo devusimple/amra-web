@@ -182,6 +182,7 @@ export default function MainView() {
                                 peer={selected}
                                 meId={meId ?? 0}
                                 phase={snapshot.chat[selected.id]}
+                                transfers={snapshot.transfers}
                                 onBack={() => setSelectedUser(null)}
                                 onCall={startCall}
                             />

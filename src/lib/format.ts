@@ -27,6 +27,50 @@ export function formatRelative(ts: number): string {
     return new Date(ts).toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
+/** Human readable byte size ("820 B", "1.4 MB"). */
+export function formatBytes(bytes: number): string {
+    const value = Math.max(0, bytes);
+    if (value < 1024) return `${Math.round(value)} B`;
+    const units = ["KB", "MB", "GB", "TB"];
+    let size = value / 1024;
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+        size /= 1024;
+        unit += 1;
+    }
+    const digits = size >= 100 ? 0 : size >= 10 ? 1 : 2;
+    return `${size.toFixed(digits).replace(/\.?0+$/, "")} ${units[unit]}`;
+}
+
+export type FileKind = "image" | "video" | "audio" | "file";
+
+/** Classify an attachment by MIME type, falling back to its extension. */
+export function fileKind(type: string | undefined, name = ""): FileKind {
+    const mime = (type || "").toLowerCase();
+    if (mime.startsWith("image/")) return "image";
+    if (mime.startsWith("video/")) return "video";
+    if (mime.startsWith("audio/")) return "audio";
+    const ext = name.toLowerCase().split(".").pop() ?? "";
+    if (["png", "jpg", "jpeg", "gif", "webp", "avif", "svg", "bmp", "heic"].includes(ext)) return "image";
+    if (["mp4", "webm", "mov", "m4v", "ogv", "mkv"].includes(ext)) return "video";
+    if (["mp3", "wav", "ogg", "m4a", "aac", "flac", "opus"].includes(ext)) return "audio";
+    return "file";
+}
+
+/** One-line label for an attachment, used in conversation previews. */
+export function filePreview(file: { name: string; type: string }): string {
+    switch (fileKind(file.type, file.name)) {
+        case "image":
+            return "📷 Photo";
+        case "video":
+            return "🎬 Video";
+        case "audio":
+            return "🎵 Audio";
+        default:
+            return `📎 ${file.name || "File"}`;
+    }
+}
+
 /** Call timer, "mm:ss" / "h:mm:ss". */
 export function formatDuration(seconds: number): string {
     const s = Math.max(0, Math.floor(seconds));

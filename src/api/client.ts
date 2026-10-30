@@ -2,7 +2,7 @@ import createClient from "openapi-fetch";
 import type { paths } from "./schema";
 import { clearSession, readSession, UNAUTHORIZED_EVENT } from "./session";
 
-export const BASE_URL = "https://amra-signal.devusimple.workers.dev";
+export const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "";
 
 export const client = createClient<paths>({
     baseUrl: BASE_URL,

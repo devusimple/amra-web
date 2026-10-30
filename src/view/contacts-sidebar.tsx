@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import type { CachedUser, Message } from "../db";
 import type { ChatPhase } from "../lib/call-manager";
-import { formatRelative } from "../lib/format";
+import { formatRelative, filePreview } from "../lib/format";
 import { Avatar } from "./avatar";
 import { LogOutIcon, PencilIcon, SearchIcon } from "./icons";
 
@@ -96,7 +96,7 @@ export function ContactsSidebar({
                         const selected = selectedId === user.id;
                         const online = phases[user.id] === "open";
                         const preview = last
-                            ? `${last.dir === "out" ? "You: " : ""}${last.body}`
+                            ? `${last.dir === "out" ? "You: " : ""}${last.file ? filePreview(last.file) : last.body}`
                             : user.bio?.trim() || "Start a conversation";
 
                         return (
