@@ -5,7 +5,7 @@ import { clearSession, readSession, UNAUTHORIZED_EVENT } from "./session";
 export const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "";
 
 export const client = createClient<paths>({
-    baseUrl: BASE_URL,
+    baseUrl: "https://amra-signal.example.workers.dev"
 });
 
 // Attach the bearer token to every outgoing request.
